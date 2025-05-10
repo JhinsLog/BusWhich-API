@@ -1,0 +1,5 @@
+spring:
+  profiles:
+    active: dev # 개발용 프로파일
+  application:
+    name: BusWhich
