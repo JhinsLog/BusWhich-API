@@ -17,6 +17,7 @@ import org.springframework.web.client.RestTemplate;
 import org.springframework.web.util.UriComponentsBuilder;
 
 import java.io.IOException;
+import java.net.URI;
 import java.util.Collections;
 import java.util.List;
 import java.util.stream.Collectors;
@@ -53,18 +54,18 @@ public class SeoulBusArrivalServiceImpl implements BusArrivalService {
     public RouteAllArrivalsResponseDto getArrivalsByRoute(String busRouteId) {
 
         // 1. API URL 구성
-        String apiUrl = UriComponentsBuilder.fromHttpUrl(arrInfoByRouteAllListUrl)
+        URI apiUri = UriComponentsBuilder.fromHttpUrl(arrInfoByRouteAllListUrl)
                 .queryParam("serviceKey", serviceKey)
                 .queryParam("busRouteId", busRouteId)
                 .queryParam("resultType", "json") // JSON 형태로 데이터 요청
                 .build(true) // serviceKey가 이미 인코딩된 값일 경우 true
-                .toUriString();
+                .toUri();
 
-        log.info("Requesting API URL (JSON): {}", apiUrl);
+        log.info("Requesting API URL (JSON): {}", apiUri.toString());
 
         try {
             // 2. API 호출 및 JSON 응답을 문자열로 받기
-            ResponseEntity<String> responseEntity = restTemplate.getForEntity(apiUrl, String.class);
+            ResponseEntity<String> responseEntity = restTemplate.getForEntity(apiUri, String.class);
             String jsonResponse = responseEntity.getBody();
 
             if (jsonResponse == null || jsonResponse.trim().isEmpty()) {
