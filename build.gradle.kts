@@ -24,11 +24,10 @@ repositories {
 }
 
 dependencies {
-    implementation("org.springframework.boot:spring-boot-starter-data-jpa")
     implementation("org.springframework.boot:spring-boot-starter-web")
-
-    // SpringDoc OpenAPI(Swagger UI)
-    implementation("org.springdoc:springdoc-openapi-starter-webmvc-ui:2.8.6")
+    implementation("org.springframework.boot:spring-boot-starter-data-jpa")     // jpa
+    implementation("org.springframework.boot:spring-boot-starter-websocket")    // Websocket
+    implementation("org.springdoc:springdoc-openapi-starter-webmvc-ui:2.8.6")   // SpringDoc OpenAPI(Swagger UI)
 
     // jwt
     implementation("io.jsonwebtoken:jjwt-api:0.12.6")

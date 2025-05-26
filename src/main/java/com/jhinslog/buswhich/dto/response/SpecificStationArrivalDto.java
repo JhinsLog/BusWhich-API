@@ -9,7 +9,7 @@ import lombok.NoArgsConstructor;
 @Builder
 @NoArgsConstructor
 @AllArgsConstructor
-public class StationSpecificArrivalDto {
+public class SpecificStationArrivalDto {
     private String stationId;           // 정류소 ID (stId)
     private String stationName;         // 정류소명 (stNm)
     private String arsId;               // 정류소 번호 (arsId)
