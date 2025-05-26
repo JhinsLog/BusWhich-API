@@ -3,23 +3,25 @@ package com.jhinslog.buswhich.service.impl;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.jhinslog.buswhich.dto.response.RouteAllArrivalsResponseDto;
-import com.jhinslog.buswhich.dto.response.StationSpecificArrivalDto;
-import com.jhinslog.buswhich.dto.seoulbus.api.SeoulBusArrivalItemDto;
-import com.jhinslog.buswhich.dto.seoulbus.api.SeoulBusMsgBodyDto;
-import com.jhinslog.buswhich.dto.seoulbus.api.SeoulBusMsgHeaderDto;
-import com.jhinslog.buswhich.dto.seoulbus.api.SeoulBusResponseDto;
+import com.jhinslog.buswhich.dto.response.SpecificStationArrivalDto;
+import com.jhinslog.buswhich.dto.seoulbus.api.*;
 import com.jhinslog.buswhich.service.BusArrivalService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
+import org.springframework.web.client.HttpClientErrorException;
+import org.springframework.web.client.HttpServerErrorException;
+import org.springframework.web.client.RestClientException;
 import org.springframework.web.client.RestTemplate;
 import org.springframework.web.util.UriComponentsBuilder;
 
 import java.io.IOException;
 import java.net.URI;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Objects;
 import java.util.stream.Collectors;
 
 @Slf4j
@@ -36,14 +38,8 @@ public class SeoulBusArrivalServiceImpl implements BusArrivalService {
     @Value("${public-api.seoul-bus.operations.getArrInfoByRouteAllList}")
     private String arrInfoByRouteAllListUrl;    // 경유노선 전체 정류소 도착예정정보를 조회한다
 
-    @Value("${public-api.seoul-bus.operations.getArrInfoByRouteList}")
-    private String arrInfoByRouteListUrl;       // 한 정류소의 특정노선의 도착예정정보를 조회한다
-
-    @Value("${public-api.seoul-bus.operations.getLowArrInfoByRouteList}")
-    private String lowArrInfoByRouteListUrl;    // 정류소ID로 저상버스 도착예정정보를 조회한다
-
-    @Value("${public-api.seoul-bus.operations.getLowArrInfoByStIdList}")
-    private String lowArrInfoByStIdListUrl;     // 한 정류소의 특정노선의 저상버스 도착예정정보를 조회한다
+    @Value("${public-api.seoul-bus.operations.getRouteByStationList}")
+    private String routeByStationListUrl; // 정류소고유번호를 입력받아 경유하는 노선목록을 조회한다.
 
     public SeoulBusArrivalServiceImpl(RestTemplate restTemplate, ObjectMapper objectMapper) {
         this.restTemplate = restTemplate;
@@ -116,7 +112,7 @@ public class SeoulBusArrivalServiceImpl implements BusArrivalService {
             }
             String routeTypeApi = arrivalItems.get(0).getRouteType();
 
-            List<StationSpecificArrivalDto> stationArrivals = arrivalItems.stream()
+            List<SpecificStationArrivalDto> stationArrivals = arrivalItems.stream()
                     .map(this::transformToStationSpecificArrivalDto)
                     .collect(Collectors.toList());
 
@@ -136,6 +132,114 @@ public class SeoulBusArrivalServiceImpl implements BusArrivalService {
         }
     }
 
+    @Override
+    public List<SpecificStationArrivalDto> getArrivalsByStationId(String arsId) {
+        // 1단계: arsId를 사용하여 해당 정류소를 경유하는 모든 노선 ID 목록 가져오기
+        List<String> busRouteIds = getBusRouteIdsForStation(arsId);
+
+        if (busRouteIds.isEmpty()) {
+            log.info("No bus routes found passing through station with arsId: {}", arsId);
+            return Collections.emptyList();
+        }
+
+        List<SpecificStationArrivalDto> allArrivalsAtStation = new ArrayList<>();
+
+        // 2단계: 각 노선 ID에 대해 전체 정류소 목록 및 상세 도착 정보 조회 후 필터링
+        for (String busRouteId : busRouteIds) {
+            try {
+                URI routeDetailApiUri = UriComponentsBuilder.fromHttpUrl(arrInfoByRouteAllListUrl)
+                        .queryParam("serviceKey", serviceKey)
+                        .queryParam("busRouteId", busRouteId)
+                        .queryParam("resultType", "json")
+                        .build(true)
+                        .toUri();
+
+                log.debug("Requesting all stops for route {} to find info for arsId {}: {}", busRouteId, arsId, routeDetailApiUri);
+                ResponseEntity<String> responseEntity = restTemplate.getForEntity(routeDetailApiUri, String.class);
+                String jsonResponse = responseEntity.getBody();
+
+                if (jsonResponse == null || jsonResponse.trim().isEmpty()) {
+                    log.warn("API response for getArrInfoByRouteAllList is null or empty for busRouteId: {}", busRouteId);
+                    continue;
+                }
+
+                TypeReference<SeoulBusResponseDto<SeoulBusArrivalItemDto>> typeRef = new TypeReference<>() {};
+                SeoulBusResponseDto<SeoulBusArrivalItemDto> apiResponse = objectMapper.readValue(jsonResponse, typeRef);
+
+                if (apiResponse == null || apiResponse.getMsgHeader() == null || !"0".equals(apiResponse.getMsgHeader().getHeaderCd())) {
+                    log.warn("API error or invalid response for getArrInfoByRouteAllList for busRouteId: {}. Header: {}",
+                            busRouteId, apiResponse != null ? apiResponse.getMsgHeader() : "null");
+                    continue;
+                }
+
+                SeoulBusMsgBodyDto<SeoulBusArrivalItemDto> msgBody = apiResponse.getMsgBody();
+                if (msgBody != null && msgBody.getItemList() != null) {
+                    msgBody.getItemList().stream()
+                            .filter(item -> arsId.equals(item.getArsId())) // arsId로 필터링
+                            .findFirst() // 해당 정류소 정보를 찾으면
+                            .ifPresent(item -> allArrivalsAtStation.add(transformToStationSpecificArrivalDto(item)));
+                }
+            } catch (IOException e) {
+                log.error("Error parsing JSON for getArrInfoByRouteAllList for busRouteId {}: {}", busRouteId, e.getMessage());
+            } catch (HttpClientErrorException | HttpServerErrorException e) {
+                log.error("HTTP Error {} for getArrInfoByRouteAllList for busRouteId {}. Response: {}", e.getStatusCode(), busRouteId, e.getResponseBodyAsString(), e);
+            } catch (RestClientException e) {
+                log.error("Error calling API getArrInfoByRouteAllList for busRouteId {}: {}", busRouteId, e.getMessage());
+            } catch (Exception e) {
+                log.error("Unexpected error processing getArrInfoByRouteAllList for busRouteId {}: {}", busRouteId, e.getMessage(), e);
+            }
+        }
+        return allArrivalsAtStation;
+    }
+
+    // 1단계를 위한 헬퍼 메소드: arsId로 해당 정류소를 경유하는 노선 ID 목록 조회
+    private List<String> getBusRouteIdsForStation(String arsId) {
+        URI apiUri = UriComponentsBuilder.fromHttpUrl(routeByStationListUrl)
+                .queryParam("serviceKey", serviceKey)
+                .queryParam("arsId", arsId) // API 요청 변수명에 맞게
+                .queryParam("resultType", "json")
+                .build(true)
+                .toUri();
+
+        log.debug("Requesting routes for station (arsId: {}): {}", arsId, apiUri);
+        try {
+            ResponseEntity<String> responseEntity = restTemplate.getForEntity(apiUri, String.class);
+            String jsonResponse = responseEntity.getBody();
+
+            if (jsonResponse == null || jsonResponse.trim().isEmpty()) {
+                log.warn("API response for getRouteByStationList is null or empty for arsId: {}", arsId);
+                return Collections.emptyList();
+            }
+
+            TypeReference<SeoulBusResponseDto<SeoulBusRouteByStationItemDto>> typeRef = new TypeReference<>() {};
+            SeoulBusResponseDto<SeoulBusRouteByStationItemDto> apiResponse = objectMapper.readValue(jsonResponse, typeRef);
+
+            if (apiResponse == null || apiResponse.getMsgHeader() == null || !"0".equals(apiResponse.getMsgHeader().getHeaderCd())) {
+                log.warn("API error or invalid response for getRouteByStationList for arsId: {}. Header: {}",
+                        arsId, apiResponse != null ? apiResponse.getMsgHeader() : "null");
+                return Collections.emptyList();
+            }
+
+            SeoulBusMsgBodyDto<SeoulBusRouteByStationItemDto> msgBody = apiResponse.getMsgBody();
+            if (msgBody != null && msgBody.getItemList() != null) {
+                return msgBody.getItemList().stream()
+                        .map(SeoulBusRouteByStationItemDto::getBusRouteId)
+                        .filter(Objects::nonNull) // busRouteId가 null이 아닌 경우만
+                        .distinct()
+                        .collect(Collectors.toList());
+            }
+        } catch (IOException e) {
+            log.error("Error parsing JSON for getRouteByStationList for arsId {}: {}", arsId, e.getMessage());
+        } catch (HttpClientErrorException | HttpServerErrorException e) {
+            log.error("HTTP Error {} for getRouteByStationList for arsId {}. Response: {}", e.getStatusCode(), arsId, e.getResponseBodyAsString(), e);
+        } catch (RestClientException e) {
+            log.error("Error calling API getRouteByStationList for arsId {}: {}", arsId, e.getMessage());
+        } catch (Exception e) {
+            log.error("Unexpected error fetching routes for arsId {}: {}", arsId, e.getMessage(), e);
+        }
+        return Collections.emptyList();
+    }
+
     private RouteAllArrivalsResponseDto buildErrorResponse(String busRouteId, String errorMessage) {
         return RouteAllArrivalsResponseDto.builder()
                 .routeId(busRouteId)
@@ -146,8 +250,8 @@ public class SeoulBusArrivalServiceImpl implements BusArrivalService {
     }
 
     // SeoulBusArrivalItemDto -> StationSpecificArrivalDto 변환 헬퍼 메소드
-    private StationSpecificArrivalDto transformToStationSpecificArrivalDto(SeoulBusArrivalItemDto item) {
-        return StationSpecificArrivalDto.builder()
+    private SpecificStationArrivalDto transformToStationSpecificArrivalDto(SeoulBusArrivalItemDto item) {
+        return SpecificStationArrivalDto.builder()
                 .stationId(item.getStId())
                 .stationName(item.getStNm())
                 .arsId(item.getArsId())
