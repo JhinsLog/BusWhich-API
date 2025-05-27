@@ -1,5 +1,6 @@
 package com.jhinslog.buswhich.websocket;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.jhinslog.buswhich.dto.request.WebSocketSubscriptionRequestDto;
 import com.jhinslog.buswhich.dto.response.SpecificStationArrivalDto;
@@ -22,16 +23,11 @@ import java.util.concurrent.ConcurrentHashMap;
 public class ArrivalBusInfoHandler extends TextWebSocketHandler {
 
     private static final Logger logger = LoggerFactory.getLogger(ArrivalBusInfoHandler.class);
-    private final ObjectMapper objectMapper; // JSON 직렬화/역직렬화
-    private final BusArrivalService busArrivalService; // 버스 도착 정보 서비스
+    private final ObjectMapper objectMapper;
+    private final BusArrivalService busArrivalService;
 
-    // 세션과 구독 중인 정류소 ID를 매핑하여 관리합니다.
-    // Key: WebSocketSession, Value: stationId (구독 중인 정류소 ID)
+    // 세션과 해당 세션이 구독한 정류소 ID를 매핑하여 관리
     private final Map<WebSocketSession, String> sessionStationMap = new ConcurrentHashMap<>();
-
-    // (선택 사항) 특정 정류소 ID를 구독하는 세션 목록을 관리할 수도 있습니다.
-    // Key: stationId, Value: List<WebSocketSession>
-    // private final Map<String, List<WebSocketSession>> stationSubscriptions = new ConcurrentHashMap<>();
 
     @Autowired
     public ArrivalBusInfoHandler(ObjectMapper objectMapper, BusArrivalService busArrivalService) {
@@ -42,115 +38,157 @@ public class ArrivalBusInfoHandler extends TextWebSocketHandler {
     @Override
     public void afterConnectionEstablished(WebSocketSession session) throws Exception {
         logger.info("WebSocket connection established: {} (ID: {})", session.getRemoteAddress(), session.getId());
-        // sessionStationMap.put(session, null); // 초기에는 구독 정보 없음
-        // 연결된 클라이언트에게 환영 메시지 또는 구독 요청 안내 메시지 전송 (선택 사항)
-        session.sendMessage(new TextMessage("Welcome! Please send your station ID to subscribe. (e.g., {\"stationId\":\"12345\"})"));
+        // 클라이언트에게 연결 성공 및 구독 안내 메시지 전송
+        sendMessage(session, Map.of(
+                "type", "connection_success",
+                "message", "Welcome! Send a message like {\"type\":\"subscribe\", \"stationId\":\"YOUR_ARS_ID\"} to get bus arrival info."
+        ));
     }
 
+    /*구독, 비구독에 따라 분기 처리*/
     @Override
     protected void handleTextMessage(WebSocketSession session, TextMessage message) throws Exception {
         String payload = message.getPayload();
-        logger.info("Received message from {}: {}", session.getId(), payload);
+        logger.info("Received message from session {}: {}", session.getId(), payload);
 
         try {
-            // 클라이언트로부터 받은 메시지를 DTO로 변환 (예: 구독 요청)
-            // 여기서는 간단히 stationId를 받는다고 가정. 실제로는 JSON 객체 형태가 더 좋음.
-            // 예: {"type": "subscribe", "stationId": "12345"}
-            // 예: {"type": "unsubscribe"}
-
-            // 임시로, 클라이언트가 stationId 문자열만 보낸다고 가정
-            // String stationId = payload;
-
-            // JSON 형태의 구독 요청을 처리하는 경우
             WebSocketSubscriptionRequestDto requestDto = objectMapper.readValue(payload, WebSocketSubscriptionRequestDto.class);
 
-            if ("subscribe".equalsIgnoreCase(requestDto.getType()) && requestDto.getStationId() != null) {
-                String stationId = requestDto.getStationId();
-                // 기존 구독 정보가 있다면 제거 (다른 정류소로 변경 시)
-                removePreviousSubscription(session);
-
-                sessionStationMap.put(session, stationId);
-                logger.info("Session {} subscribed to stationId: {}", session.getId(), stationId);
-                session.sendMessage(new TextMessage("Subscribed to station: " + stationId));
-
-                // 구독 즉시 해당 정류소의 현재 도착 정보 1회 전송
-                sendInitialArrivalInfo(session, stationId);
-
-            } else if ("unsubscribe".equalsIgnoreCase(requestDto.getType())) {
-                removePreviousSubscription(session);
-                logger.info("Session {} unsubscribed.", session.getId());
-                session.sendMessage(new TextMessage("Unsubscribed successfully."));
-            } else {
-                logger.warn("Invalid message format from session {}: {}", session.getId(), payload);
-                session.sendMessage(new TextMessage("Error: Invalid message format. Send e.g., {\"type\":\"subscribe\", \"stationId\":\"YOUR_STATION_ID\"}"));
+            if (requestDto.getType() == null) {
+                sendErrorMessage(session, "Message type is missing.");
+                return;
             }
 
-        } catch (IOException e) {
-            logger.error("Error processing message from session {}: {}", session.getId(), payload, e);
-            session.sendMessage(new TextMessage("Error processing your request: " + e.getMessage()));
+            switch (requestDto.getType().toLowerCase()) {
+                case "subscribe":
+                    handleSubscription(session, requestDto.getStationId());
+                    break;
+                case "unsubscribe":
+                    handleUnsubscription(session);
+                    break;
+                default:
+                    sendErrorMessage(session, "Invalid message type: " + requestDto.getType() +
+                            ". Supported types are 'subscribe' or 'unsubscribe'.");
+                    break;
+            }
+        } catch (JsonProcessingException e) { //Json 파싱 실패시 오류 메시지 처리
+            logger.error("Error parsing JSON message from session {}: {}", session.getId(), payload, e);
+            sendErrorMessage(session, "Invalid JSON format. Please send a valid JSON message.");
         } catch (Exception e) {
             logger.error("Unexpected error processing message from session {}: {}", session.getId(), payload, e);
-            session.sendMessage(new TextMessage("An unexpected error occurred."));
+            sendErrorMessage(session, "An unexpected error occurred while processing your request.");
         }
     }
 
-    private void removePreviousSubscription(WebSocketSession session) {
-        String previousStationId = sessionStationMap.remove(session);
-        if (previousStationId != null) {
-            logger.info("Session {} removed previous subscription to stationId: {}", session.getId(), previousStationId);
+    private void handleSubscription(WebSocketSession session, String stationId) throws IOException {
+        if (stationId == null || stationId.trim().isEmpty()) {
+            sendErrorMessage(session, "Station ID (arsId) is required for subscription.");
+            return;
+        }
+
+        // 기존 구독 정보가 있다면 제거 (다른 정류소로 변경 시)
+        String previousStationId = sessionStationMap.get(session);
+        if (previousStationId != null && !previousStationId.equals(stationId)) {
+            logger.info("Session {} changing subscription from {} to {}", session.getId(), previousStationId, stationId);
+        }
+        sessionStationMap.put(session, stationId);
+        logger.info("Session {} subscribed to stationId: {}", session.getId(), stationId);
+
+        // 구독 성공 응답 전송
+        sendMessage(session, Map.of(
+                "type", "subscribe_success",
+                "stationId", stationId,
+                "message", "Successfully subscribed to station " + stationId + "."
+        ));
+
+        // 구독 즉시 해당 정류소의 현재 도착 정보 1회 전송
+        sendInitialArrivalInfo(session, stationId);
+    }
+
+    private void handleUnsubscription(WebSocketSession session) throws IOException {
+        String removedStationId = sessionStationMap.remove(session);
+        if (removedStationId != null) {
+            logger.info("Session {} unsubscribed from stationId: {}", session.getId(), removedStationId);
+            sendMessage(session, Map.of(
+                    "type", "unsubscribe_success",
+                    "stationId", removedStationId,
+                    "message", "Successfully unsubscribed from station " + removedStationId + "."
+            ));
+        } else {
+            logger.warn("Session {} tried to unsubscribe but was not subscribed.", session.getId());
+            sendErrorMessage(session, "You are not currently subscribed to any station.");
         }
     }
 
     // 특정 세션에 초기 도착 정보 전송
     private void sendInitialArrivalInfo(WebSocketSession session, String stationId) {
         try {
-            session.sendMessage(new TextMessage("Subscription to " + stationId + " successful. Real-time data feed will start once available. (Service method pending)"));
-            logger.warn("BusArrivalService.getArrivalsByStationId(String stationId) method is not yet implemented or called.");
+            List<SpecificStationArrivalDto> arrivalInfo = busArrivalService.getArrivalsByStationId(stationId);
 
-
-        } catch (Exception e) {
-            logger.error("Error sending initial arrival info for station {} to session {}: {}", stationId, session.getId(), e.getMessage(), e);
-            try {
-                session.sendMessage(new TextMessage("Error fetching initial data for station: " + stationId));
-            } catch (IOException ex) {
-                logger.error("Error sending error message to session {}: {}", session.getId(), ex.getMessage());
+            if (arrivalInfo != null && !arrivalInfo.isEmpty()) {
+                sendMessage(session, Map.of(
+                        "type", "arrival_info",
+                        "stationId", stationId,
+                        "data", arrivalInfo
+                ));
+                logger.info("Sent initial arrival info for stationId {} to session {}", stationId, session.getId());
+            } else {
+                logger.info("No arrival info found for stationId {} or list is empty. Notifying client.", stationId);
+                sendMessage(session, Map.of(
+                        "type", "no_arrival_info",
+                        "stationId", stationId,
+                        "message", "No arrival information currently available for station " + stationId + "."
+                ));
             }
+        } catch (Exception e) {
+            logger.error("Error fetching or sending initial arrival info for station {} to session {}: {}",
+                    stationId, session.getId(), e.getMessage(), e);
+            sendErrorMessage(session, "Error fetching initial arrival data for station: " + stationId + ".");
         }
     }
 
-    // 주기적으로 모든 구독자에게 업데이트된 정보를 보내는 메소드 (별도의 스케줄러에서 호출될 수 있음)
-    // 또는 특정 이벤트 발생 시 호출
+    // 주기적으로 모든 구독자에게 업데이트된 정보를 보내는 메소드
     public void broadcastArrivalUpdates(String stationId, List<SpecificStationArrivalDto> arrivalInfo) {
-        if (arrivalInfo == null || arrivalInfo.isEmpty()) {
-            // logger.debug("No updates to broadcast for stationId: {}", stationId);
-            return;
-        }
-
-        String arrivalInfoJson;
-        try {
-            arrivalInfoJson = objectMapper.writeValueAsString(arrivalInfo);
-        } catch (IOException e) {
-            logger.error("Error serializing arrival info for stationId {}: {}", stationId, e.getMessage());
+        if (arrivalInfo == null) { // 빈 리스트도 보낼 수 있도록 null 체크만
+            logger.debug("No updates (null list) to broadcast for stationId: {}", stationId);
             return;
         }
 
         sessionStationMap.forEach((session, subscribedStationId) -> {
             if (stationId.equals(subscribedStationId) && session.isOpen()) {
                 try {
-                    session.sendMessage(new TextMessage(arrivalInfoJson));
-                    logger.info("Broadcasted arrival update for station {} to session {}", stationId, session.getId());
-                } catch (IOException e) {
-                    logger.error("Error sending message to session {}: {}", session.getId(), e.getMessage());
-                    // 세션이 닫혔거나 문제가 있을 수 있으므로, 여기서 세션 제거 로직을 고려할 수도 있습니다.
-                    // sessions.remove(session);
+                    // 도착 정보가 비어있을 수도 있으므로, 그 경우에도 메시지를 보낼 수 있게 함
+                    if (arrivalInfo.isEmpty()) {
+                        sendMessage(session, Map.of(
+                                "type", "no_arrival_info", // 또는 "arrival_update_empty" 등
+                                "stationId", stationId,
+                                "message", "No arrival information currently available for station " + stationId + "."
+                        ));
+                        logger.info("Broadcasted empty arrival update for station {} to session {}", stationId, session.getId());
+                    } else {
+                        sendMessage(session, Map.of(
+                                "type", "arrival_info_update", // 초기 정보와 구분하기 위해 다른 type 사용 가능
+                                "stationId", stationId,
+                                "data", arrivalInfo
+                        ));
+                        logger.info("Broadcasted arrival update for station {} to session {}", stationId, session.getId());
+                    }
+                } catch (Exception e) {
+                    logger.error("Error broadcasting message to session {}: {}", session.getId(), e.getMessage(), e);
+                    // 여기서 세션 제거 로직을 고려할 수 있지만, 동시성 문제에 주의해야 합니다.
+                    // sessionStationMap.remove(session); // 직접 제거 시 ConcurrentModificationException 발생 가능성
                 }
             }
         });
     }
 
+
     @Override
     public void handleTransportError(WebSocketSession session, Throwable exception) throws Exception {
-        logger.error("WebSocket transport error for session {}: {}", session.getId(), exception.getMessage());
+        logger.error("WebSocket transport error for session {} (ID: {}): {}",
+                session.getRemoteAddress(), session.getId(), exception.getMessage(), exception);
+        // 전송 오류 발생 시, 해당 세션의 구독 정보를 제거하는 것이 안전할 수 있습니다.
+        sessionStationMap.remove(session);
     }
 
     @Override
@@ -158,5 +196,22 @@ public class ArrivalBusInfoHandler extends TextWebSocketHandler {
         String removedStationId = sessionStationMap.remove(session);
         logger.info("WebSocket connection closed: {} (ID: {}) - Status: {}. Unsubscribed from station: {}",
                 session.getRemoteAddress(), session.getId(), status, removedStationId != null ? removedStationId : "N/A");
+    }
+
+    // 클라이언트에게 메시지를 보내는 헬퍼 메소드 (JSON 변환 포함)
+    private void sendMessage(WebSocketSession session, Map<String, Object> messagePayload) {
+        try {
+            if (session.isOpen()) {
+                String jsonMessage = objectMapper.writeValueAsString(messagePayload);
+                session.sendMessage(new TextMessage(jsonMessage));
+            }
+        } catch (IOException e) {
+            logger.error("Error serializing or sending message to session {}: {}", session.getId(), e.getMessage(), e);
+        }
+    }
+
+    // 클라이언트에게 오류 메시지를 보내는 헬퍼 메소드
+    private void sendErrorMessage(WebSocketSession session, String errorMessage) {
+        sendMessage(session, Map.of("type", "error", "message", errorMessage));
     }
 }
