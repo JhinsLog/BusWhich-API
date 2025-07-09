@@ -1,11 +1,9 @@
 package com.jhinslog.buswhich.dto.response;
 
-import lombok.AllArgsConstructor;
-import lombok.Builder;
-import lombok.Getter;
-import lombok.NoArgsConstructor;
+import lombok.*;
 
 @Getter
+@Setter
 @Builder
 @NoArgsConstructor
 @AllArgsConstructor
@@ -15,6 +13,7 @@ public class SpecificStationArrivalDto {
     private String arsId;               // 정류소 번호 (arsId)
     private String stationOrder;        // 해당 노선에서의 정류소 순번 (staOrd)
     private String direction;           // 진행 방향 (dir)
+    private String routeName;           // 노선명
 
     private String firstArrivalMsg;     // 첫 번째 버스 도착 메시지 (arrmsg1)
     private Integer firstRemainingSec;  // 첫 번째 버스 남은 시간(초) (traTime1 또는 exps1 등에서 변환)

@@ -5,7 +5,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.jhinslog.buswhich.dto.response.RouteAllArrivalsResponseDto;
 import com.jhinslog.buswhich.dto.response.SpecificStationArrivalDto;
 import com.jhinslog.buswhich.dto.seoulbus.api.*;
+import com.jhinslog.buswhich.service.ApiCallManager;
 import com.jhinslog.buswhich.service.BusArrivalService;
+import com.jhinslog.buswhich.util.ApiOperation;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.ResponseEntity;
@@ -25,43 +27,47 @@ import java.util.Objects;
 import java.util.stream.Collectors;
 
 @Slf4j
-@Service
+@Service("seoulBusArrivalServiceImpl")
 public class SeoulBusArrivalServiceImpl implements BusArrivalService {
 
     private final RestTemplate restTemplate;
     private final ObjectMapper objectMapper;
+    private final ApiCallManager apiCallManager; // ApiCallManager 주입
 
     @Value("${public-api.seoul-bus.service-key}")
     private String serviceKey;
 
-    // application-dev.yml에 정의된 operation URL
     @Value("${public-api.seoul-bus.operations.getArrInfoByRouteAllList}")
-    private String arrInfoByRouteAllListUrl;    // 경유노선 전체 정류소 도착예정정보를 조회한다
+    private String arrInfoByRouteAllListUrl;
 
     @Value("${public-api.seoul-bus.operations.getRouteByStationList}")
-    private String routeByStationListUrl; // 정류소고유번호를 입력받아 경유하는 노선목록을 조회한다.
+    private String routeByStationListUrl;
 
-    public SeoulBusArrivalServiceImpl(RestTemplate restTemplate, ObjectMapper objectMapper) {
+    public SeoulBusArrivalServiceImpl(RestTemplate restTemplate, ObjectMapper objectMapper, ApiCallManager apiCallManager) {
         this.restTemplate = restTemplate;
         this.objectMapper = objectMapper;
+        this.apiCallManager = apiCallManager;
     }
 
     @Override
     public RouteAllArrivalsResponseDto getArrivalsByRoute(String busRouteId) {
+        if (!apiCallManager.canMakeCall(ApiOperation.GET_ARR_INFO_BY_ROUTE_ALL_LIST)) {
+            log.warn("API call limit reached for {}. Aborting call for busRouteId: {}", ApiOperation.GET_ARR_INFO_BY_ROUTE_ALL_LIST, busRouteId);
+            return buildErrorResponse(busRouteId, "일일 API 호출 한도 초과 [" + ApiOperation.GET_ARR_INFO_BY_ROUTE_ALL_LIST.getOperationName() + "]");
+        }
 
-        // 1. API URL 구성
         URI apiUri = UriComponentsBuilder.fromHttpUrl(arrInfoByRouteAllListUrl)
                 .queryParam("serviceKey", serviceKey)
                 .queryParam("busRouteId", busRouteId)
-                .queryParam("resultType", "json") // JSON 형태로 데이터 요청
-                .build(true) // serviceKey가 이미 인코딩된 값일 경우 true
+                .queryParam("resultType", "json")
+                .build(true)
                 .toUri();
 
         log.info("Requesting API URL (JSON): {}", apiUri.toString());
 
         try {
-            // 2. API 호출 및 JSON 응답을 문자열로 받기
             ResponseEntity<String> responseEntity = restTemplate.getForEntity(apiUri, String.class);
+            apiCallManager.recordCall(ApiOperation.GET_ARR_INFO_BY_ROUTE_ALL_LIST);
             String jsonResponse = responseEntity.getBody();
 
             if (jsonResponse == null || jsonResponse.trim().isEmpty()) {
@@ -71,44 +77,37 @@ public class SeoulBusArrivalServiceImpl implements BusArrivalService {
 
             log.debug("JSON Response for busRouteId {}: {}", busRouteId, jsonResponse);
 
-            // 3. JSON 문자열을 DTO로 변환 (SeoulBusResponseDto<SeoulBusArrivalItemDto> 사용)
             TypeReference<SeoulBusResponseDto<SeoulBusArrivalItemDto>> typeRef =
                     new TypeReference<SeoulBusResponseDto<SeoulBusArrivalItemDto>>() {};
             SeoulBusResponseDto<SeoulBusArrivalItemDto> apiResponse = objectMapper.readValue(jsonResponse, typeRef);
 
-            // 4. API 응답 헤더 유효성 검사
             if (apiResponse == null || apiResponse.getMsgHeader() == null) {
                 log.error("Failed to parse API response or msgHeader is null for busRouteId: {}", busRouteId);
                 return buildErrorResponse(busRouteId, "API 응답 파싱 실패");
             }
 
             SeoulBusMsgHeaderDto msgHeader = apiResponse.getMsgHeader();
-            if (!"0".equals(msgHeader.getHeaderCd())) { // "0"이 성공 코드
+            if (!"0".equals(msgHeader.getHeaderCd())) {
                 log.error("API error for busRouteId: {}. HeaderCd: {}, HeaderMsg: {}",
                         busRouteId, msgHeader.getHeaderCd(), msgHeader.getHeaderMsg());
                 return buildErrorResponse(busRouteId, "API 오류: " + msgHeader.getHeaderMsg());
             }
 
-            // 5. itemList 추출
             SeoulBusMsgBodyDto<SeoulBusArrivalItemDto> msgBody = apiResponse.getMsgBody();
             if (msgBody == null || msgBody.getItemList() == null || msgBody.getItemList().isEmpty()) {
                 log.info("No arrival information found for busRouteId: {} (itemList is null or empty)", busRouteId);
-                // 아이템이 없는 경우, 노선 정보 없이 빈 도착 정보 리스트 반환
                 return RouteAllArrivalsResponseDto.builder()
                         .routeId(busRouteId)
-                        .routeName("정보 없음") // 또는 API에서 노선명을 별도로 가져오는 로직 추가 필요
-                        .routeType("정보 없음")
+                        .routeName(null)
+                        .routeType(null)
                         .stationArrivals(Collections.emptyList())
                         .build();
             }
 
             List<SeoulBusArrivalItemDto> arrivalItems = msgBody.getItemList();
-
-            // 6. RouteAllArrivalsResponseDto로 변환
-            // 첫 번째 아이템에서 노선명과 노선 유형 추출 (모든 아이템이 동일 노선이라고 가정)
-            String routeName = arrivalItems.get(0).getBusRouteAbrv(); // 안내용 노선 약칭 사용
+            String routeName = arrivalItems.get(0).getBusRouteAbrv();
             if (routeName == null || routeName.trim().isEmpty()) {
-                routeName = arrivalItems.get(0).getRtNm(); // DB 관리용 노선명 사용
+                routeName = arrivalItems.get(0).getRtNm();
             }
             String routeTypeApi = arrivalItems.get(0).getRouteType();
 
@@ -117,15 +116,21 @@ public class SeoulBusArrivalServiceImpl implements BusArrivalService {
                     .collect(Collectors.toList());
 
             return RouteAllArrivalsResponseDto.builder()
-                    .routeId(busRouteId) // 입력받은 busRouteId 사용
+                    .routeId(busRouteId)
                     .routeName(routeName)
-                    .routeType(formatRouteType(routeTypeApi)) // 코드값을 문자열로 변환
+                    .routeType(formatRouteType(routeTypeApi))
                     .stationArrivals(stationArrivals)
                     .build();
 
-        } catch (IOException e) { // ObjectMapper.readValue()는 IOException을 던질 수 있음
+        } catch (IOException e) {
             log.error("Error parsing JSON response for busRouteId: {}", busRouteId, e);
             return buildErrorResponse(busRouteId, "JSON 파싱 오류: " + e.getMessage());
+        } catch (HttpClientErrorException | HttpServerErrorException e) {
+            log.error("HTTP Error {} for getArrInfoByRouteAllList for busRouteId {}. Response: {}", e.getStatusCode(), busRouteId, e.getResponseBodyAsString(), e);
+            return buildErrorResponse(busRouteId, "API 통신 오류 (HTTP " + e.getStatusCode() + ")");
+        } catch (RestClientException e) {
+            log.error("Error calling API getArrInfoByRouteAllList for busRouteId {}: {}", busRouteId, e.getMessage());
+            return buildErrorResponse(busRouteId, "API 호출 중 오류 발생: " + e.getMessage());
         } catch (Exception e) {
             log.error("Error processing bus arrival info for busRouteId: {}", busRouteId, e);
             return buildErrorResponse(busRouteId, "처리 중 오류 발생: " + e.getMessage());
@@ -134,18 +139,22 @@ public class SeoulBusArrivalServiceImpl implements BusArrivalService {
 
     @Override
     public List<SpecificStationArrivalDto> getArrivalsByStationId(String arsId) {
-        // 1단계: arsId를 사용하여 해당 정류소를 경유하는 모든 노선 ID 목록 가져오기
         List<String> busRouteIds = getBusRouteIdsForStation(arsId);
 
         if (busRouteIds.isEmpty()) {
-            log.info("No bus routes found passing through station with arsId: {}", arsId);
+            log.info("No bus routes found passing through station with arsId: {} or API limit reached for getRouteByStationList.", arsId);
             return Collections.emptyList();
         }
 
         List<SpecificStationArrivalDto> allArrivalsAtStation = new ArrayList<>();
 
-        // 2단계: 각 노선 ID에 대해 전체 정류소 목록 및 상세 도착 정보 조회 후 필터링
         for (String busRouteId : busRouteIds) {
+            if (!apiCallManager.canMakeCall(ApiOperation.GET_ARR_INFO_BY_ROUTE_ALL_LIST)) {
+                log.warn("API call limit reached for {}. Skipping route {} for station {}",
+                        ApiOperation.GET_ARR_INFO_BY_ROUTE_ALL_LIST, busRouteId, arsId);
+                continue;
+            }
+
             try {
                 URI routeDetailApiUri = UriComponentsBuilder.fromHttpUrl(arrInfoByRouteAllListUrl)
                         .queryParam("serviceKey", serviceKey)
@@ -156,6 +165,7 @@ public class SeoulBusArrivalServiceImpl implements BusArrivalService {
 
                 log.debug("Requesting all stops for route {} to find info for arsId {}: {}", busRouteId, arsId, routeDetailApiUri);
                 ResponseEntity<String> responseEntity = restTemplate.getForEntity(routeDetailApiUri, String.class);
+                apiCallManager.recordCall(ApiOperation.GET_ARR_INFO_BY_ROUTE_ALL_LIST);
                 String jsonResponse = responseEntity.getBody();
 
                 if (jsonResponse == null || jsonResponse.trim().isEmpty()) {
@@ -175,8 +185,8 @@ public class SeoulBusArrivalServiceImpl implements BusArrivalService {
                 SeoulBusMsgBodyDto<SeoulBusArrivalItemDto> msgBody = apiResponse.getMsgBody();
                 if (msgBody != null && msgBody.getItemList() != null) {
                     msgBody.getItemList().stream()
-                            .filter(item -> arsId.equals(item.getArsId())) // arsId로 필터링
-                            .findFirst() // 해당 정류소 정보를 찾으면
+                            .filter(item -> arsId.equals(item.getArsId()))
+                            .findFirst()
                             .ifPresent(item -> allArrivalsAtStation.add(transformToStationSpecificArrivalDto(item)));
                 }
             } catch (IOException e) {
@@ -192,11 +202,15 @@ public class SeoulBusArrivalServiceImpl implements BusArrivalService {
         return allArrivalsAtStation;
     }
 
-    // 1단계를 위한 헬퍼 메소드: arsId로 해당 정류소를 경유하는 노선 ID 목록 조회
     private List<String> getBusRouteIdsForStation(String arsId) {
+        if (!apiCallManager.canMakeCall(ApiOperation.GET_ROUTE_BY_STATION_LIST)) {
+            log.warn("API call limit reached for {}. Aborting call for arsId: {}", ApiOperation.GET_ROUTE_BY_STATION_LIST, arsId);
+            return Collections.emptyList();
+        }
+
         URI apiUri = UriComponentsBuilder.fromHttpUrl(routeByStationListUrl)
                 .queryParam("serviceKey", serviceKey)
-                .queryParam("arsId", arsId) // API 요청 변수명에 맞게
+                .queryParam("arsId", arsId)
                 .queryParam("resultType", "json")
                 .build(true)
                 .toUri();
@@ -204,6 +218,7 @@ public class SeoulBusArrivalServiceImpl implements BusArrivalService {
         log.debug("Requesting routes for station (arsId: {}): {}", arsId, apiUri);
         try {
             ResponseEntity<String> responseEntity = restTemplate.getForEntity(apiUri, String.class);
+            apiCallManager.recordCall(ApiOperation.GET_ROUTE_BY_STATION_LIST);
             String jsonResponse = responseEntity.getBody();
 
             if (jsonResponse == null || jsonResponse.trim().isEmpty()) {
@@ -224,7 +239,7 @@ public class SeoulBusArrivalServiceImpl implements BusArrivalService {
             if (msgBody != null && msgBody.getItemList() != null) {
                 return msgBody.getItemList().stream()
                         .map(SeoulBusRouteByStationItemDto::getBusRouteId)
-                        .filter(Objects::nonNull) // busRouteId가 null이 아닌 경우만
+                        .filter(Objects::nonNull)
                         .distinct()
                         .collect(Collectors.toList());
             }
@@ -249,7 +264,6 @@ public class SeoulBusArrivalServiceImpl implements BusArrivalService {
                 .build();
     }
 
-    // SeoulBusArrivalItemDto -> StationSpecificArrivalDto 변환 헬퍼 메소드
     private SpecificStationArrivalDto transformToStationSpecificArrivalDto(SeoulBusArrivalItemDto item) {
         return SpecificStationArrivalDto.builder()
                 .stationId(item.getStId())
@@ -257,15 +271,13 @@ public class SeoulBusArrivalServiceImpl implements BusArrivalService {
                 .arsId(item.getArsId())
                 .stationOrder(item.getStaOrd())
                 .direction(item.getDir())
-                // 첫 번째 버스 정보
                 .firstArrivalMsg(item.getArrmsg1())
-                .firstRemainingSec(parseIntegerSafe(item.getExps1())) // exps1: 지수평활 도착예정시간(초)
+                .firstRemainingSec(parseIntegerSafe(item.getExps1()))
                 .firstBusType(formatBusType(item.getBusType1()))
                 .firstPlainNo(item.getPlainNo1())
                 .firstIsLowFloor(isLowFloor(item.getBusType1()))
                 .firstCongestion(formatCongestion(item.getBrerdeDiv1(), item.getBrdrdeNum1(), item.getRouteType()))
                 .firstIsLastBus(isLastBus(item.getIsLast1()))
-                // 두 번째 버스 정보
                 .secondArrivalMsg(item.getArrmsg2())
                 .secondRemainingSec(parseIntegerSafe(item.getExps2()))
                 .secondBusType(formatBusType(item.getBusType2()))
@@ -273,20 +285,15 @@ public class SeoulBusArrivalServiceImpl implements BusArrivalService {
                 .secondIsLowFloor(isLowFloor(item.getBusType2()))
                 .secondCongestion(formatCongestion(item.getBrerdeDiv2(), item.getBrdrdeNum2(), item.getRouteType()))
                 .secondIsLastBus(isLastBus(item.getIsLast2()))
-                // 우회 여부
-                .detourYn("11".equals(item.getDeTourAt())) // "00": 정상, "11": 우회
+                .detourYn("11".equals(item.getDeTourAt()))
                 .build();
     }
 
-    // --- 데이터 가공을 위한 헬퍼 메소드들 ---
     private Integer parseIntegerSafe(String value) {
         if (value == null || value.trim().isEmpty() || "0".equals(value)) {
-            // "0"은 실제 0초일 수도 있고, 데이터 없음을 의미할 수도 있음. API 명세에 따라 해석.
-            // 여기서는 도착 예정 시간이므로 0은 곧 도착 또는 정보 없음으로 간주될 수 있음. null로 반환하여 구분.
             return null;
         }
         try {
-            // 숫자만 있는지 간단히 확인 (더 엄밀한 검증은 정규식 사용 가능)
             if (!value.matches("\\d+")) {
                 log.warn("Non-numeric value encountered for time: '{}'", value);
                 return null;
@@ -298,7 +305,6 @@ public class SeoulBusArrivalServiceImpl implements BusArrivalService {
         }
     }
 
-    // 버스 타입 정보
     private String formatBusType(String busTypeCode) {
         if (busTypeCode == null) return "정보없음";
         return switch (busTypeCode) {
@@ -310,41 +316,34 @@ public class SeoulBusArrivalServiceImpl implements BusArrivalService {
     }
 
     private Boolean isLowFloor(String busTypeCode) {
-        return "1".equals(busTypeCode); // 1: 저상버스
+        return "1".equals(busTypeCode);
     }
 
-    // 혼잡도 변환 (brerdeDiv, brdrdeNum 사용)
     private String formatCongestion(String divCode, String numCode, String routeType) {
         if (divCode == null || numCode == null) return "정보없음";
-
-        // brerde_Div1/2: brdrde_Num1/2 값의 의미 구분(0: 데이터 없음, 2: 재차인원, 4:혼잡도)
-        // brdrde_Num1/2: 재차구분 4일 때 혼잡도(0: 데이터없음, 3: 여유, 4: 보통, 5: 혼잡)
-        //                재차구분 2일 때 재차인원 또는 잔여좌석수(routeType = 6) 서울시 광역버스
         switch (divCode) {
-            case "4": // 혼잡도
+            case "4":
                 return switch (numCode) {
                     case "3" -> "여유";
                     case "4" -> "보통";
                     case "5" -> "혼잡";
-                    default -> "정보없음"; // "0" 또는 기타 값
+                    default -> "정보없음";
                 };
-            case "2": // 재차인원 또는 잔여좌석
-                if ("6".equals(routeType)) { // 광역버스
+            case "2":
+                if ("6".equals(routeType)) {
                     return "잔여좌석: " + numCode;
                 } else {
                     return "재차인원: " + numCode;
                 }
-            default: // "0" 또는 기타 값
+            default:
                 return "정보없음";
         }
     }
 
-    //막차 여부
     private Boolean isLastBus(String isLastCode) {
-        return "1".equals(isLastCode); // 0:막차아님, 1:막차
+        return "1".equals(isLastCode);
     }
 
-    //노선 유형
     private String formatRouteType(String routeTypeCode) {
         if (routeTypeCode == null) return "정보없음";
         return switch (routeTypeCode) {
@@ -361,5 +360,4 @@ public class SeoulBusArrivalServiceImpl implements BusArrivalService {
             default -> "기타(" + routeTypeCode + ")";
         };
     }
-
 }
